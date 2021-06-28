@@ -166,6 +166,18 @@ def test_setuptools_path(packages_path):
 
 
 @pytest.fixture
+def test_setuptools_space(packages_path):
+    path = tempfile.mkdtemp(prefix='setuptools with space')
+    # TODO: use pathlib once Python 2 is dropped
+    shutil.copy(os.path.join(packages_path, 'test-setuptools', 'pyproject.toml'), os.path.join(path, 'pyproject.toml'))
+    shutil.copy(os.path.join(packages_path, 'test-setuptools', 'setup.cfg'), os.path.join(path, 'setup.cfg'))
+
+    yield path
+
+    shutil.rmtree(path)
+
+
+@pytest.fixture
 def test_bad_wheel_path(packages_path):
     return os.path.join(packages_path, 'test-bad-wheel')
 

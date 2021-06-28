@@ -210,6 +210,24 @@ def test_build_package_via_sdist(tmp_dir, test_setuptools_path):
     ]
 
 
+def test_build_package_space(tmp_dir, test_setuptools_space):
+    build.__main__.build_package(test_setuptools_space, tmp_dir, ['sdist', 'wheel'])
+
+    assert sorted(os.listdir(tmp_dir)) == [
+        'test_setuptools-1.0.0-py2.py3-none-any.whl',
+        'test_setuptools-1.0.0.tar.gz',
+    ]
+
+
+def test_build_package_space_via_sdist(tmp_dir, test_setuptools_space):
+    build.__main__.build_package_via_sdist(test_setuptools_space, tmp_dir, ['wheel'])
+
+    assert sorted(os.listdir(tmp_dir)) == [
+        'test_setuptools-1.0.0-py2.py3-none-any.whl',
+        'test_setuptools-1.0.0.tar.gz',
+    ]
+
+
 def test_build_package_via_sdist_cant_build(tmp_dir, test_cant_build_via_sdist_path):
     with pytest.raises(build.BuildBackendException):
         build.__main__.build_package_via_sdist(test_cant_build_via_sdist_path, tmp_dir, ['wheel'])
