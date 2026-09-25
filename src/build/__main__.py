@@ -216,7 +216,15 @@ def _bootstrap_build_env(
     installer: _env.Installer,
     env_dir: str | None = None,
     runner: SubprocessRunner | None = None,
+    *,
+    backend_requires: bool = True,
 ) -> Generator[ProjectBuilder]:
+    """
+    Prepare a :class:`ProjectBuilder` with its build dependencies available.
+
+    :param backend_requires: Also install (or check) the dependencies the ``get_requires_for_build_*`` hook
+        returns; ``False`` prepares only ``build-system.requires``, enough to call that hook
+    """
     runner = runner or pyproject_hooks.default_subprocess_runner
     if isolation:
         with DefaultIsolatedEnv(installer=installer, path=env_dir) as env:
@@ -226,9 +234,11 @@ def _bootstrap_build_env(
 
             # first install the build dependencies
             install(builder.build_system_requires, _fresh=True)
-            # then get the extra required dependencies from the backend (which was installed in the call above :P)
-            extra_requires = builder.get_requires_for_build(distribution, config_settings)
-            install(extra_requires)
+            extra_requires = set[str]()
+            if backend_requires:
+                # then get the extra required dependencies from the backend (which was installed in the call above :P)
+                extra_requires = builder.get_requires_for_build(distribution, config_settings)
+                install(extra_requires)
 
             _log_dependency_versions(env, builder.build_system_requires | extra_requires)
 
@@ -237,9 +247,15 @@ def _bootstrap_build_env(
     else:
         builder = ProjectBuilder(srcdir, runner=runner)
 
-        if not skip_dependency_check and (missing := builder.check_dependencies(distribution, config_settings)):
-            _cprint()
-            _error(format_unmet_dependencies(missing))
+        if not skip_dependency_check:
+            missing = (
+                builder.check_dependencies(distribution, config_settings)
+                if backend_requires
+                else {unmet for requirement in builder.build_system_requires for unmet in check_dependency(requirement)}
+            )
+            if missing:
+                _cprint()
+                _error(format_unmet_dependencies(missing))
 
         yield builder
 
@@ -472,7 +488,6 @@ def _build_metadata(
 def _build_requires(
     srcdir: StrPath,
     outdir: StrPath,  # noqa: ARG001
-    distributions: Sequence[Distribution],
     config_settings: ConfigSettings | None = None,
     isolation: bool = True,
     skip_dependency_check: bool = False,
@@ -480,13 +495,13 @@ def _build_requires(
     installer: _env.Installer = 'pip',
     env_dir: str | None = None,
     *,
-    requires_type: _RequiresType = 'both',
+    distribution: Distribution,
+    requires_type: _RequiresType,
 ) -> list[str]:
-    (distribution,) = distributions
-    static = ProjectBuilder(srcdir).build_system_requires
-    dynamic = set[str]()
-    if requires_type != 'static':
-        dynamic = _dynamic_requires(
+    if requires_type == 'static':
+        requires = ProjectBuilder(srcdir).build_system_requires
+    else:
+        with _bootstrap_build_env(
             isolation,
             srcdir,
             distribution,
@@ -495,37 +510,15 @@ def _build_requires(
             dependency_constraints_txt,
             installer,
             env_dir,
-        )
-    requires = dynamic if requires_type == 'dynamic' else static | dynamic
+            runner=_run_subprocess,
+            backend_requires=False,
+        ) as builder:
+            requires = builder.get_requires_for_build(distribution, config_settings)
+            if requires_type == 'both':
+                requires |= builder.build_system_requires
     for requirement in sorted(requires):
         print(requirement)  # noqa: T201
     return []
-
-
-def _dynamic_requires(
-    isolation: bool,
-    srcdir: StrPath,
-    distribution: Distribution,
-    config_settings: ConfigSettings | None,
-    skip_dependency_check: bool,
-    dependency_constraints_txt: os.PathLike[str] | None,
-    installer: _env.Installer,
-    env_dir: str | None,
-) -> set[str]:
-    # Only the static requirements are needed to run the hook
-    if isolation:
-        with DefaultIsolatedEnv(installer=installer, path=env_dir) as env:
-            builder = ProjectBuilder.from_isolated_env(env, srcdir, runner=_run_subprocess)
-            env.install(builder.build_system_requires, constraints_txt_path=dependency_constraints_txt, _fresh=True)
-            return builder.get_requires_for_build(distribution, config_settings)
-
-    builder = ProjectBuilder(srcdir, runner=_run_subprocess)
-    if not skip_dependency_check and (
-        missing := {unmet for requirement in builder.build_system_requires for unmet in check_dependency(requirement)}
-    ):
-        _cprint()
-        _error(format_unmet_dependencies(missing))
-    return builder.get_requires_for_build(distribution, config_settings)
 
 
 def _run_subprocess(cmd: Sequence[StrPath], cwd: str | None = None, extra_environ: Mapping[str, str] | None = None) -> None:
@@ -692,10 +685,10 @@ def main_parser() -> argparse.ArgumentParser:
         help='requirements that ``--requires`` prints: ``static`` (``build-system.requires``, no backend call), '
         '``dynamic`` (from the backend ``get_requires_for_build_*`` hook), or ``both`` (default)',
     )
-    build_group.add_argument(
+    query_exclusive_group.add_argument(
         '--report',
         help='write a machine-readable JSON report of the built artifacts (name, path, kind, size and SHA-256 hash) '
-        'to this path. Cannot be used together with ``--metadata``',
+        'to this path. Cannot be used together with ``--metadata`` or ``--requires``',
         metavar='PATH',
     )
     config_exclusive_group = build_group.add_mutually_exclusive_group()
@@ -892,11 +885,8 @@ def _resolve_config_settings(args: _CliArgs) -> Mapping[str, JSONValue]:
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: _CliArgs, *, sdist_input: bool, wheel_input: bool) -> None:
-    for option, enabled in (('--metadata', args.metadata), ('--requires', args.requires)):
-        if enabled and args.report is not None:
-            parser.error(f'--report: not allowed with {option}')
-        if enabled and args.distributions:
-            parser.error(f'{option}: not allowed with --sdist or --wheel')
+    if args.distributions and (args.metadata or args.requires):
+        parser.error(f'{"--metadata" if args.metadata else "--requires"}: not allowed with --sdist or --wheel')
     if args.requires_type is not None and not args.requires:
         parser.error('--requires-type: only allowed with --requires')
     if wheel_input and not args.metadata:
@@ -915,7 +905,7 @@ def _select_build(
     if args.metadata:
         return partial(_build_metadata, distributions=['wheel'])
     if args.requires:
-        return partial(_build_requires, distributions=[args.requires], requires_type=args.requires_type or 'both')
+        return partial(_build_requires, distribution=args.requires, requires_type=args.requires_type or 'both')
     if sdist_input:
         distributions: list[Distribution] = args.distributions or ['wheel']
         return partial(build_package, distributions=distributions)
