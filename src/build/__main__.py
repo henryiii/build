@@ -60,7 +60,7 @@ import build.env as _env
 from build import ProjectBuilder, _ctx
 from build._compat.tarfile import safe_extractall
 from build._exceptions import BuildBackendException, BuildException, FailedProcessError
-from build._util import format_unmet_dependencies
+from build._util import check_dependency, format_unmet_dependencies
 from build.env import DefaultIsolatedEnv
 
 
@@ -68,8 +68,11 @@ TYPE_CHECKING = False
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Mapping, Sequence
+    from typing import Literal
 
     from build._types import ConfigSettings, Distribution, JSONValue, StrPath, SubprocessRunner
+
+    _RequiresType = Literal['static', 'dynamic', 'both']
 
 
 class _CliArgs:
@@ -80,6 +83,8 @@ class _CliArgs:
     outdir: str | None
     distributions: list[Distribution] | None
     metadata: bool
+    requires: Distribution | None
+    requires_type: _RequiresType | None
     config_settings: list[str] | None
     config_json: str | None
     installer: _env.Installer
@@ -441,12 +446,6 @@ def _build_metadata(
         _print_metadata(_wheel_metadata(srcdir))
         return []
 
-    def run_subprocess(cmd: Sequence[StrPath], cwd: str | None = None, extra_environ: Mapping[str, str] | None = None) -> None:
-        env = os.environ.copy()
-        if extra_environ:
-            env.update(extra_environ)
-        _ctx.run_subprocess(cmd, cwd, env)
-
     with (
         _bootstrap_build_env(
             isolation,
@@ -457,7 +456,7 @@ def _build_metadata(
             dependency_constraints_txt,
             installer,
             env_dir,
-            runner=run_subprocess,
+            runner=_run_subprocess,
         ) as builder,
         tempfile.TemporaryDirectory() as tempdir,
         open(
@@ -468,6 +467,72 @@ def _build_metadata(
         _print_metadata(metadata_file.read())
 
     return []
+
+
+def _build_requires(
+    srcdir: StrPath,
+    outdir: StrPath,  # noqa: ARG001
+    distributions: Sequence[Distribution],
+    config_settings: ConfigSettings | None = None,
+    isolation: bool = True,
+    skip_dependency_check: bool = False,
+    dependency_constraints_txt: os.PathLike[str] | None = None,
+    installer: _env.Installer = 'pip',
+    env_dir: str | None = None,
+    *,
+    requires_type: _RequiresType = 'both',
+) -> list[str]:
+    (distribution,) = distributions
+    static = ProjectBuilder(srcdir).build_system_requires
+    dynamic = set[str]()
+    if requires_type != 'static':
+        dynamic = _dynamic_requires(
+            isolation,
+            srcdir,
+            distribution,
+            config_settings,
+            skip_dependency_check,
+            dependency_constraints_txt,
+            installer,
+            env_dir,
+        )
+    requires = dynamic if requires_type == 'dynamic' else static | dynamic
+    for requirement in sorted(requires):
+        print(requirement)  # noqa: T201
+    return []
+
+
+def _dynamic_requires(
+    isolation: bool,
+    srcdir: StrPath,
+    distribution: Distribution,
+    config_settings: ConfigSettings | None,
+    skip_dependency_check: bool,
+    dependency_constraints_txt: os.PathLike[str] | None,
+    installer: _env.Installer,
+    env_dir: str | None,
+) -> set[str]:
+    # Only the static requirements are needed to run the hook
+    if isolation:
+        with DefaultIsolatedEnv(installer=installer, path=env_dir) as env:
+            builder = ProjectBuilder.from_isolated_env(env, srcdir, runner=_run_subprocess)
+            env.install(builder.build_system_requires, constraints_txt_path=dependency_constraints_txt, _fresh=True)
+            return builder.get_requires_for_build(distribution, config_settings)
+
+    builder = ProjectBuilder(srcdir, runner=_run_subprocess)
+    if not skip_dependency_check and (
+        missing := {unmet for requirement in builder.build_system_requires for unmet in check_dependency(requirement)}
+    ):
+        _cprint()
+        _error(format_unmet_dependencies(missing))
+    return builder.get_requires_for_build(distribution, config_settings)
+
+
+def _run_subprocess(cmd: Sequence[StrPath], cwd: str | None = None, extra_environ: Mapping[str, str] | None = None) -> None:
+    env = os.environ.copy()
+    if extra_environ:
+        env.update(extra_environ)
+    _ctx.run_subprocess(cmd, cwd, env)
 
 
 def _wheel_metadata(wheel: StrPath) -> bytes:
@@ -608,11 +673,24 @@ def main_parser() -> argparse.ArgumentParser:
         const='wheel',
         help='build a wheel (disables the default behavior)',
     )
-    build_group.add_argument(
+    query_exclusive_group = build_group.add_mutually_exclusive_group()
+    query_exclusive_group.add_argument(
         '--metadata',
         action='store_true',
         help="print out a wheel's metadata in JSON format, building it first unless the source argument is already a "
         '.whl. Cannot be used in conjunction with ``--sdist`` or ``--wheel``',
+    )
+    query_exclusive_group.add_argument(
+        '--requires',
+        choices=('sdist', 'wheel', 'editable'),
+        help='print out the build requirements of a distribution, one per line, without building it. '
+        'Cannot be used in conjunction with ``--sdist``, ``--wheel`` or ``--report``',
+    )
+    build_group.add_argument(
+        '--requires-type',
+        choices=('static', 'dynamic', 'both'),
+        help='requirements that ``--requires`` prints: ``static`` (``build-system.requires``, no backend call), '
+        '``dynamic`` (from the backend ``get_requires_for_build_*`` hook), or ``both`` (default)',
     )
     build_group.add_argument(
         '--report',
@@ -813,22 +891,31 @@ def _resolve_config_settings(args: _CliArgs) -> Mapping[str, JSONValue]:
     return {}
 
 
-def _select_build(
-    parser: argparse.ArgumentParser, args: _CliArgs, *, sdist_input: bool, wheel_input: bool
-) -> partial[list[str]]:
-    if args.report is not None and args.metadata:
-        parser.error('--report: not allowed with --metadata')
+def _validate_args(parser: argparse.ArgumentParser, args: _CliArgs, *, sdist_input: bool, wheel_input: bool) -> None:
+    for option, enabled in (('--metadata', args.metadata), ('--requires', args.requires)):
+        if enabled and args.report is not None:
+            parser.error(f'--report: not allowed with {option}')
+        if enabled and args.distributions:
+            parser.error(f'{option}: not allowed with --sdist or --wheel')
+    if args.requires_type is not None and not args.requires:
+        parser.error('--requires-type: only allowed with --requires')
     if wheel_input and not args.metadata:
         parser.error('a wheel can only be used with --metadata, to read its metadata; it cannot be built from')
-    if args.metadata and args.distributions:
-        parser.error('--metadata: not allowed with --sdist or --wheel')
     if sdist_input and args.distributions and 'sdist' in args.distributions:
         parser.error(
             'cannot build a source distribution from a source distribution; '
             'pass --wheel to build a wheel from the sdist (see https://github.com/pypa/build/issues/311)'
         )
+
+
+def _select_build(
+    parser: argparse.ArgumentParser, args: _CliArgs, *, sdist_input: bool, wheel_input: bool
+) -> partial[list[str]]:
+    _validate_args(parser, args, sdist_input=sdist_input, wheel_input=wheel_input)
     if args.metadata:
         return partial(_build_metadata, distributions=['wheel'])
+    if args.requires:
+        return partial(_build_requires, distributions=[args.requires], requires_type=args.requires_type or 'both')
     if sdist_input:
         distributions: list[Distribution] = args.distributions or ['wheel']
         return partial(build_package, distributions=distributions)

@@ -1,0 +1,1 @@
+Add ``--requires {sdist,wheel,editable}`` and ``--requires-type {static,dynamic,both}`` to print the build requirements.

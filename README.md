@@ -35,6 +35,8 @@ line as `pyproject-build` once installed.
 - `--sdist` (`-s`): Produce just an SDist
 - `--wheel` (`-w`): Produce just a wheel
 - `--metadata`: Produce just the metadata as JSON. Cannot be used with `--sdist`/`--wheel`.
+- `--requires {sdist,wheel,editable}`: Print the build requirements, one per line. Use
+  `--requires-type {static,dynamic,both}` to select the requirements (default: both).
 - `-C<option>=<value>`: A Config-setting, the PEP 517 way of passing options to a backend. Can be passed multiple times.
   Matching options will make a list. Note that setuptools has very limited support.
 - `--config-json=<value>`: An alternative way to pass in complex config settings as JSON strings. Can't be used with

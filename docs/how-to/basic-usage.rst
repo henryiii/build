@@ -306,6 +306,29 @@ To extract package metadata without building the full package:
 This outputs the wheel metadata in JSON format to stdout.
 
 ****************************
+ Getting build requirements
+****************************
+
+To print the requirements that are necessary to build a distribution, one per line:
+
+.. code-block:: console
+
+    $ python -m build --requires wheel
+
+The argument is ``sdist``, ``wheel``, or ``editable``. By default, build prints the static requirements from
+``build-system.requires`` and the dynamic requirements that the ``get_requires_for_build_*`` hook of the backend gives.
+Use ``--requires-type static`` or ``--requires-type dynamic`` to print only one of these sets. The static requirements
+come from ``pyproject.toml`` only, so ``--requires-type static`` does not create an environment or call the backend.
+
+To get the dynamic requirements, build installs the static requirements in an isolated environment and calls the hook.
+With ``--no-isolation``, build calls the hook in the current environment instead. Config settings go to the hook, so the
+output can change with ``-C``:
+
+.. code-block:: console
+
+    $ python -m build --requires wheel --no-isolation -C build-dir=build | xargs pip install
+
+****************************
  Checking the build version
 ****************************
 

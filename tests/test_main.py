@@ -1426,3 +1426,97 @@ def test_metadata_from_wheel_without_dist_info(tmp_path: pathlib.Path, capsys: p
         build.__main__.main([str(path), '--metadata'])
 
     assert 'is not a valid wheel' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ('distribution', 'requires_type', 'expected'),
+    [
+        ('sdist', 'dynamic', ['sdist-dep']),
+        ('wheel', 'dynamic', ['wheel-dep']),
+        ('editable', 'dynamic', ['editable-dep']),
+        ('wheel', 'both', ['wheel-dep']),
+        ('wheel', 'static', []),
+    ],
+)
+def test_requires_no_isolation(
+    package_test_dynamic_requires: str,
+    capsys: pytest.CaptureFixture[str],
+    distribution: str,
+    requires_type: str,
+    expected: list[str],
+) -> None:
+    build.__main__.main([package_test_dynamic_requires, '-n', '--requires', distribution, '--requires-type', requires_type])
+
+    assert capsys.readouterr().out.splitlines() == expected
+
+
+def test_requires_config_settings(package_test_dynamic_requires: str, capsys: pytest.CaptureFixture[str]) -> None:
+    build.__main__.main([package_test_dynamic_requires, '-n', '--requires', 'wheel', '-C', 'extra=b a'])
+
+    assert capsys.readouterr().out.splitlines() == ['a', 'b', 'wheel-dep']
+
+
+@pytest.mark.parametrize('requires_type', [None, 'static'])
+def test_requires_static(
+    mocker: pytest_mock.MockerFixture,
+    package_test_setuptools: str,
+    capsys: pytest.CaptureFixture[str],
+    requires_type: str | None,
+) -> None:
+    mocker.patch('build.ProjectBuilder.get_requires_for_build', return_value={'wheel'})
+    env = mocker.patch('build.__main__.DefaultIsolatedEnv')
+
+    type_args = ['--requires-type', requires_type] if requires_type else []
+    build.__main__.main([package_test_setuptools, '--requires', 'wheel', *type_args])
+
+    if requires_type == 'static':
+        env.assert_not_called()
+        assert capsys.readouterr().out.splitlines() == ['setuptools >= 42.0.0']
+    else:
+        env.return_value.__enter__.return_value.install.assert_called_once_with(
+            {'setuptools >= 42.0.0'}, constraints_txt_path=None, _fresh=True
+        )
+        assert capsys.readouterr().out.splitlines() == ['setuptools >= 42.0.0', 'wheel']
+
+
+@pytest.mark.isolated
+def test_requires_isolation(package_test_dynamic_requires: str, capsys: pytest.CaptureFixture[str]) -> None:
+    build.__main__.main([package_test_dynamic_requires, '--requires', 'sdist'])
+
+    assert capsys.readouterr().out.splitlines() == ['sdist-dep']
+
+
+@pytest.mark.parametrize('skip', [False, True])
+def test_requires_no_isolation_unmet(
+    mocker: pytest_mock.MockerFixture,
+    package_test_setuptools: str,
+    capsys: pytest.CaptureFixture[str],
+    skip: bool,
+) -> None:
+    mocker.patch('build.__main__.check_dependency', return_value=[('setuptools >= 42.0.0',)])
+    mocker.patch('build.ProjectBuilder.get_requires_for_build', return_value=set())
+
+    skip_args = ['-x'] if skip else []
+    if skip:
+        build.__main__.main([package_test_setuptools, '-n', '--requires', 'wheel', *skip_args])
+        assert capsys.readouterr().out.splitlines() == ['setuptools >= 42.0.0']
+    else:
+        with pytest.raises(SystemExit):
+            build.__main__.main([package_test_setuptools, '-n', '--requires', 'wheel'])
+        assert 'Unmet dependencies' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ('args', 'message'),
+    [
+        (['--requires', 'wheel', '--sdist'], '--requires: not allowed with --sdist or --wheel'),
+        (['--requires', 'wheel', '--metadata'], 'not allowed with argument --requires'),
+        (['--requires', 'wheel', '--report', 'r.json'], '--report: not allowed with --requires'),
+        (['--requires-type', 'static'], '--requires-type: only allowed with --requires'),
+    ],
+)
+def test_requires_invalid_args(capsys: pytest.CaptureFixture[str], args: list[str], message: str) -> None:
+    with pytest.raises(SystemExit):
+        build.__main__.main(args)
+
+    assert message in capsys.readouterr().err
